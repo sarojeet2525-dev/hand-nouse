@@ -1,0 +1,162 @@
+import cv2
+import mediapipe as mp
+import pyautogui
+import numpy as np
+import time
+
+import sys
+import os
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def main():
+    # PyAutoGUI Setup
+    pyautogui.FAILSAFE = True # Move physical mouse to corner of screen to abort
+    # Optional: Disable pyautogui pause to make movement smoother
+    pyautogui.PAUSE = 0
+    
+    screenWidth, screenHeight = pyautogui.size()
+    
+    # Camera Setup
+    cap = cv2.VideoCapture(0)
+    cam_w, cam_h = 640, 480
+    cap.set(3, cam_w)
+    cap.set(4, cam_h)
+    
+    # MediaPipe Tasks API Setup (MediaPipe >= 0.10.x requirement)
+    BaseOptions = mp.tasks.BaseOptions
+    HandLandmarker = mp.tasks.vision.HandLandmarker
+    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+
+    # Set up hand landmarker options using the recently downloaded model async/video mode
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=resource_path('hand_landmarker.task')),
+        running_mode=VisionRunningMode.VIDEO, 
+        num_hands=1)
+    
+    # Variables for movement and gestures
+    frameR = 100 # Frame reduction for easier reach
+    smoothing = 7 # Smoothing factor for jitter reduction
+    plocX, plocY = 0, 0
+    clocX, clocY = 0, 0
+    
+    # State flags for clicks to prevent rapid firing
+    clicked_left = False
+    clicked_right = False
+    clicked_double = False
+    
+    print("Virtual Mouse Started. Press 'Esc' to exit.")
+
+    # Initialize landmarker
+    with HandLandmarker.create_from_options(options) as landmarker:
+        while True:
+            success, img = cap.read()
+            if not success:
+                print("Failed to capture from webcam.")
+                break
+            
+            # Flip image for natural interaction
+            img = cv2.flip(img, 1)
+            cv2.rectangle(img, (frameR, frameR), (cam_w - frameR, cam_h - frameR), (255, 0, 255), 2)
+            
+            # Convert frame to RGB for MediaPipe
+            imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=imgRGB)
+            
+            # MediaPipe tasks API expects a timestamp in ms for video running mode
+            frame_timestamp_ms = int(time.time() * 1000)
+            result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+            
+            if result.hand_landmarks:
+                for handLms in result.hand_landmarks:
+                    # Finger Tips Landmarks: 4=Thumb, 8=Index, 12=Middle, 16=Ring
+                    if len(handLms) > 16:
+                        x1, y1 = int(handLms[8].x * cam_w), int(handLms[8].y * cam_h)
+                        x2, y2 = int(handLms[4].x * cam_w), int(handLms[4].y * cam_h)
+                        xm, ym = int(handLms[12].x * cam_w), int(handLms[12].y * cam_h)
+                        xr, yr = int(handLms[16].x * cam_w), int(handLms[16].y * cam_h)
+                        
+                        # 1. Convert Coordinates for index finger to screen resolution
+                        x3 = np.interp(x1, (frameR, cam_w - frameR), (0, screenWidth))
+                        y3 = np.interp(y1, (frameR, cam_h - frameR), (0, screenHeight))
+                        
+                        # 2. Smooth Values
+                        clocX = plocX + (x3 - plocX) / smoothing
+                        clocY = plocY + (y3 - plocY) / smoothing
+                        
+                        # 3. Calculate distances between thumb and other fingers
+                        length_index = np.hypot(x2 - x1, y2 - y1) # Left click distance
+                        length_middle = np.hypot(x2 - xm, y2 - ym) # Right click distance
+                        length_ring = np.hypot(x2 - xr, y2 - yr) # Double click distance
+                        
+                        # Distance between index and middle fingers (for scroll mode)
+                        length_index_middle = np.hypot(xm - x1, ym - y1)
+                        
+                        try:
+                            # A. Scrolling Mode: Index and Middle fingers together, Thumb away
+                            if length_index_middle < 40 and length_index > 40:
+                                # Distance moved in Y axis
+                                scroll_amount = int((plocY - clocY) * 2) 
+                                if abs(scroll_amount) > 1: # Small deadzone to prevent accidental jitter scrolls
+                                    # Highlight both fingers being used for scrolling
+                                    cv2.circle(img, (x1, y1), 15, (255, 255, 0), cv2.FILLED)
+                                    pyautogui.scroll(scroll_amount)
+                            
+                            # B. Regular Movement: All fingers separated
+                            elif length_index > 40 and length_middle > 40 and length_ring > 40:
+                                pyautogui.moveTo(clocX, clocY)
+                                cv2.circle(img, (x1, y1), 15, (255, 0, 255), cv2.FILLED)
+                                # Reset all click states since fingers are open
+                                clicked_left = False
+                                clicked_right = False
+                                clicked_double = False
+                                
+                            # C. Left Click: Pinch Index and Thumb (Middle separated)
+                            elif length_index < 40 and length_middle > 40:
+                                if not clicked_left:
+                                    cv2.circle(img, (x1, y1), 15, (0, 255, 0), cv2.FILLED)
+                                    pyautogui.click()
+                                    clicked_left = True
+                                    
+                            # D. Right Click: Pinch Middle and Thumb (Index separated)
+                            elif length_middle < 40 and length_index > 40:
+                                if not clicked_right:
+                                    cv2.circle(img, (xm, ym), 15, (0, 0, 255), cv2.FILLED)
+                                    pyautogui.rightClick()
+                                    clicked_right = True
+                                    
+                            # E. Double Click: Pinch Ring and Thumb
+                            elif length_ring < 40:
+                                if not clicked_double:
+                                    cv2.circle(img, (xr, yr), 15, (0, 255, 255), cv2.FILLED)
+                                    pyautogui.doubleClick()
+                                    clicked_double = True
+                                    
+                        except pyautogui.FailSafeException:
+                            print("PyAutoGUI Failsafe triggered!")
+                            cap.release()
+                            cv2.destroyAllWindows()
+                            return
+                        
+                        plocX, plocY = clocX, clocY
+                    
+                    # Draw basic landmarks for visual feedback
+                    for lm in handLms:
+                        cx, cy = int(lm.x * cam_w), int(lm.y * cam_h)
+                        cv2.circle(img, (cx, cy), 3, (255, 0, 0), cv2.FILLED)
+
+            cv2.imshow("Hand Tracking Mouse", img)
+            if cv2.waitKey(1) & 0xFF == 27: 
+                break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
